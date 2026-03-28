@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GlitchPilot.Console/GlitchPilot.Console.csproj" />
+    <Project Path="src/GlitchPilot.Core/GlitchPilot.Core.csproj" />
+    <Project Path="src/GlitchPilot.Functions/GlitchPilot.Functions.csproj" />
+  </Folder>
+</Solution>
