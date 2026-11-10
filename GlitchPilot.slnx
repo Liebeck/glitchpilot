@@ -4,4 +4,7 @@
     <Project Path="src/GlitchPilot.Core/GlitchPilot.Core.csproj" />
     <Project Path="src/GlitchPilot.Functions/GlitchPilot.Functions.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GlitchPilot.Core.Tests/GlitchPilot.Core.Tests.csproj" />
+  </Folder>
 </Solution>

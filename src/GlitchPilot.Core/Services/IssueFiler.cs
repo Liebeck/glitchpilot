@@ -8,7 +8,7 @@ using Octokit;
 
 namespace GlitchPilot.Core.Services;
 
-public sealed class IssueFiler : IIssueFiler
+public sealed partial class IssueFiler : IIssueFiler
 {
     private readonly GitHubClient _gh;
     private readonly HttpClient _http;
@@ -43,29 +43,51 @@ public sealed class IssueFiler : IIssueFiler
     public async Task<int?> FileAsync(TriageOutcome outcome, CancellationToken ct = default)
     {
         var candidate = outcome.Candidate;
+        var owner = candidate.GitHubOwner;
+        var repo = candidate.GitHubRepo;
+
+        // Duplicate guard — check for an open issue/PR carrying any of the GlitchTip labels
+        IReadOnlyDictionary<string, ExistingWorkItem> tracked;
+        try
+        {
+            tracked = await GetTrackedErrorsAsync(owner, repo, outcome.AllErrorIds, ct);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.LogError(ex, "Duplicate lookup failed for error {Id} — not filing to avoid duplicates", candidate.ErrorId);
+            return null;
+        }
+
+        if (TrackingLabels.Find(tracked, outcome.AllErrorIds) is { } existing)
+        {
+            _log.LogInformation("Error {Id} already tracked as #{Num}, skipping",
+                candidate.ErrorId, existing.Number);
+            await AddTrackingLabelsAsync(owner, repo, existing.Number,
+                TrackingLabels.Missing(tracked, existing.Number, outcome.AllErrorIds), ct);
+            return existing.Number;
+        }
+
+        return await CreateAsync(outcome, ct);
+    }
+
+    public async Task<int?> CreateAsync(TriageOutcome outcome, CancellationToken ct = default)
+    {
+        var candidate = outcome.Candidate;
         var verdict = outcome.Verdict;
         var owner = candidate.GitHubOwner;
         var repo = candidate.GitHubRepo;
 
-        // Duplicate guard — check for existing issue with the same GlitchTip label
-        var refLabel = $"glitchtip:{candidate.ErrorId}";
-        if (await FindExistingByLabelAsync(owner, repo, refLabel) is { } existingNumber)
-        {
-            _log.LogInformation("Error {Id} already tracked as #{Num}, skipping",
-                candidate.ErrorId, existingNumber);
-            return existingNumber;
-        }
-
         var aiTitle = string.IsNullOrWhiteSpace(verdict.IssueTitle)
             ? candidate.ErrorTitle : verdict.IssueTitle;
         var title = FormatTitle(candidate.ErrorId, aiTitle);
-        var body = ComposeBody(candidate, verdict);
+        var body = ComposeBody(outcome);
 
         var request = new NewIssue(title) { Body = body };
 
         foreach (var lbl in _labels)
             request.Labels.Add(lbl);
-        request.Labels.Add(refLabel);
+        foreach (var lbl in outcome.AllErrorIds.Select(TrackingLabels.For).Distinct())
+            request.Labels.Add(lbl);
         request.Labels.Add($"priority:{verdict.Priority}");
         request.Labels.Add($"type:{verdict.ErrorType}");
         if (_agentLabel is not null)
@@ -82,7 +104,7 @@ public sealed class IssueFiler : IIssueFiler
 
             return created.Number;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             _log.LogError(ex, "Failed to file issue for error {Id}", candidate.ErrorId);
             return null;
@@ -128,24 +150,240 @@ public sealed class IssueFiler : IIssueFiler
         }
     }
 
-    private async Task<int?> FindExistingByLabelAsync(string owner, string repo, string label)
+    public async Task<IReadOnlyDictionary<string, ExistingWorkItem>> GetTrackedErrorsAsync(
+        string owner, string repo, IEnumerable<string> errorIds, CancellationToken ct = default)
     {
+        // Searches open issues AND pull requests for exactly the glitchtip:{id} labels of this run
+        // (comma = OR in GitHub search). Independent of other labels, so manually relabelled issues
+        // are still found. Failures propagate — callers must not treat "lookup failed" as "not tracked".
+        var tracked = new Dictionary<string, ExistingWorkItem>();
+        var wanted = errorIds.Distinct().ToHashSet();
+
+        // The search API rejects queries without is:issue / is:pull-request (HTTP 422) — query both
+        var results = new List<(Issue Issue, bool IsPullRequest)>();
+        foreach (var term in BuildLabelSearchTerms(wanted, owner, repo))
+        {
+            foreach (var type in new[] { IssueTypeQualifier.Issue, IssueTypeQualifier.PullRequest })
+            {
+                ct.ThrowIfCancellationRequested();
+                var request = new SearchIssuesRequest(term)
+                {
+                    Repos = new RepositoryCollection { { owner, repo } },
+                    State = ItemState.Open,
+                    Type = type,
+                    PerPage = 100,
+                };
+                var found = await _gh.Search.SearchIssues(request);
+                results.AddRange(found.Items.Select(i => (i, type == IssueTypeQualifier.PullRequest)));
+            }
+        }
+
+        foreach (var (issue, isPullRequest) in results.OrderBy(r => r.Issue.Number))
+        {
+            ExistingWorkItem? item = null;
+            foreach (var label in issue.Labels)
+            {
+                if (!label.Name.StartsWith(TrackingLabels.Prefix, StringComparison.Ordinal)) continue;
+                var id = label.Name[TrackingLabels.Prefix.Length..];
+                if (!wanted.Contains(id)) continue;
+                item ??= new ExistingWorkItem
+                {
+                    Number = issue.Number,
+                    Title = issue.Title,
+                    Url = issue.HtmlUrl,
+                    IsPullRequest = isPullRequest,
+                    CreatedAt = issue.CreatedAt,
+                };
+                tracked.TryAdd(id, item);
+            }
+        }
+
+        return tracked;
+    }
+
+    /// <summary>
+    /// Builds search terms like <c>label:"glitchtip:1","glitchtip:2"</c>, split so each full query
+    /// (term + repo/state qualifiers) stays below GitHub's 256 character limit.
+    /// </summary>
+    internal static List<string> BuildLabelSearchTerms(IEnumerable<string> errorIds, string owner, string repo)
+    {
+        const int maxQueryLength = 256;
+        var qualifiers = $" repo:{owner}/{repo} state:open is:pull-request".Length;
+        var terms = new List<string>();
+        var current = new List<string>();
+
+        string Term(IEnumerable<string> labels) => "label:" + string.Join(',', labels.Select(l => $"\"{l}\""));
+
+        foreach (var id in errorIds.Distinct())
+        {
+            var label = TrackingLabels.For(id);
+            if (current.Count > 0 && Term(current.Append(label)).Length + qualifiers > maxQueryLength)
+            {
+                terms.Add(Term(current));
+                current.Clear();
+            }
+            current.Add(label);
+        }
+        if (current.Count > 0)
+            terms.Add(Term(current));
+        return terms;
+    }
+
+    public Task AddTrackingLabelsAsync(string owner, string repo, int number, IEnumerable<string> errorIds,
+        CancellationToken ct = default) =>
+        AddLabelsAsync(owner, repo, number, errorIds.Select(TrackingLabels.For).Distinct().ToList(), ct);
+
+    public async Task<IReadOnlyList<ExistingWorkItem>> ListOpenWorkAsync(
+        string owner, string repo, int maxItems, CancellationToken ct = default)
+    {
+        // Open issues filed by GlitchPilot (identified by the first base label)
+        var filter = new RepositoryIssueRequest
+        {
+            State = ItemStateFilter.Open,
+            SortProperty = IssueSort.Created,
+            SortDirection = SortDirection.Descending,
+        };
+        if (_labels.Count > 0)
+            filter.Labels.Add(_labels[0]);
+
+        var pageSize = Math.Clamp(maxItems, 1, 100);
+        var issueOptions = new ApiOptions
+        {
+            PageSize = pageSize,
+            PageCount = (int)Math.Ceiling(maxItems / (double)pageSize),
+            StartPage = 1,
+        };
+
+        var issues = (await _gh.Issue.GetAllForRepository(owner, repo, filter, issueOptions))
+            .Where(i => i.PullRequest is null)
+            .Take(maxItems)
+            .ToList();
+
+        ct.ThrowIfCancellationRequested();
+
+        var prs = await _gh.PullRequest.GetAllForRepository(owner, repo,
+            new PullRequestRequest { State = ItemStateFilter.Open },
+            new ApiOptions { PageSize = 100, PageCount = 1, StartPage = 1 });
+
+        var items = issues.Select(i => new ExistingWorkItem
+        {
+            Number = i.Number,
+            Title = i.Title,
+            Url = i.HtmlUrl,
+            CreatedAt = i.CreatedAt,
+            Excerpt = WorkItemText.Excerpt(i.Body),
+        }).ToList();
+
+        var byNumber = items.ToDictionary(i => i.Number);
+
+        foreach (var pr in prs)
+        {
+            var linked = new LinkedPullRequest
+            {
+                Number = pr.Number,
+                Url = pr.HtmlUrl,
+                Title = pr.Title,
+                Draft = pr.Draft,
+            };
+
+            var refs = WorkItemText.ReferencedIssues(pr.Body, byNumber.Keys);
+            foreach (var n in refs)
+                byNumber[n].PullRequests.Add(linked);
+
+            // PRs without an open GlitchPilot issue (e.g. issue already closed) are candidates themselves,
+            // as long as the overall limit (prompt size) is not reached
+            if (refs.Count == 0 && items.Count < maxItems && WorkItemText.MentionsGlitchTip(pr.Title, pr.Body))
+                items.Add(new ExistingWorkItem
+                {
+                    Number = pr.Number,
+                    Title = pr.Title,
+                    Url = pr.HtmlUrl,
+                    IsPullRequest = true,
+                    CreatedAt = pr.CreatedAt,
+                    Excerpt = WorkItemText.Excerpt(pr.Body),
+                });
+        }
+
+        _log.LogInformation("{Owner}/{Repo}: {Issues} open GlitchPilot issue(s), {Prs} open PR(s) for duplicate scan",
+            owner, repo, issues.Count, prs.Count);
+
+        return items;
+    }
+
+    public async Task AnnotateRecurrenceAsync(TriageOutcome outcome, KnownDuplicate known, CancellationToken ct = default)
+    {
+        var c = outcome.Candidate;
+        var owner = c.GitHubOwner;
+        var repo = c.GitHubRepo;
+
+        // Tracking labels (+ base label so the history scan lists the item as GlitchPilot work)
+        var labels = outcome.AllErrorIds.Select(TrackingLabels.For).Distinct().ToList();
+        if (_labels.Count > 0)
+            labels.Add(_labels[0]);
+        await AddLabelsAsync(owner, repo, known.Number, labels, ct);
+
+        var all = new[] { outcome }.Concat(outcome.MergedOutcomes).ToList();
+        var kind = known.IsPullRequest ? "pull request" : "issue";
+        var plural = all.Count == 1 ? "" : "s";
+        var sb = new StringBuilder();
+        sb.AppendLine("### 🔁 Recurrence detected by GlitchPilot");
+        sb.AppendLine();
+        sb.AppendLine($"This problem occurred again. GlitchPilot matched the following GlitchTip error{plural} to this {kind} and did **not** start a new Copilot run:");
+        sb.AppendLine();
+        foreach (var o in all)
+            sb.AppendLine($"- [GlitchTip #{o.Candidate.ErrorId}]({o.Candidate.GlitchTipLink}) — {SafeMarkdown(o.Candidate.ErrorTitle)} ({o.Candidate.Occurrences}×, last seen {o.Candidate.LastOccurredAt ?? "—"})");
+        if (!string.IsNullOrWhiteSpace(known.Reason))
+        {
+            sb.AppendLine();
+            sb.AppendLine($"> {SafeMarkdown(known.Reason)}");
+        }
+
         try
         {
-            var filter = new RepositoryIssueRequest
-            {
-                State = ItemStateFilter.Open,
-            };
-            filter.Labels.Add(label);
-
-            var issues = await _gh.Issue.GetAllForRepository(owner, repo, filter);
-            return issues.Count > 0 ? issues[0].Number : null;
+            ct.ThrowIfCancellationRequested();
+            await _gh.Issue.Comment.Create(owner, repo, known.Number, sb.ToString());
+            _log.LogInformation("Commented recurrence of #{Id} on #{Num}", c.ErrorId, known.Number);
         }
-        catch
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            return null; // If lookup fails, allow creation
+            _log.LogWarning(ex, "Failed to comment recurrence on #{Num}", known.Number);
         }
     }
+
+    private async Task AddLabelsAsync(string owner, string repo, int number, IReadOnlyList<string> labels, CancellationToken ct)
+    {
+        if (labels.Count == 0) return;
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            await _gh.Issue.Labels.AddToIssue(owner, repo, number, labels.ToArray());
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "Failed to add labels to #{Num}", number);
+        }
+    }
+
+    /// <summary>
+    /// Neutralises untrusted text (exception messages, AI output) for GitHub Markdown:
+    /// no @mentions and #123 cross-references (zero-width space), no injected links, HTML or code spans.
+    /// </summary>
+    internal static string SafeMarkdown(string text)
+    {
+        var safe = text
+            .Replace("\r", "")
+            .Replace("\n", " ")
+            .Replace("@", "@\u200B")
+            .Replace("[", "\\[")
+            .Replace("]", "\\]")
+            .Replace("`", "\\`")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;");
+        return IssueRefRegex().Replace(safe, "#\u200B$1");
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"#(\d)")]
+    private static partial System.Text.RegularExpressions.Regex IssueRefRegex();
 
     private static string FormatTitle(string errorId, string title)
     {
@@ -155,8 +393,10 @@ public sealed class IssueFiler : IIssueFiler
         return prefix + trimmed;
     }
 
-    private static string ComposeBody(TriageCandidate c, Verdict v)
+    internal static string ComposeBody(TriageOutcome outcome)
     {
+        var c = outcome.Candidate;
+        var v = outcome.Verdict;
         var sb = new System.Text.StringBuilder();
 
         // Problem
@@ -175,11 +415,15 @@ public sealed class IssueFiler : IIssueFiler
             sb.AppendLine();
         }
 
-        // Files to Investigate
-        if (v.FilesToInvestigate.Count > 0)
+        // Files to Investigate (including those of merged errors — the fix must cover all of them)
+        var files = v.FilesToInvestigate
+            .Concat(outcome.MergedOutcomes.SelectMany(m => m.Verdict.FilesToInvestigate))
+            .Distinct()
+            .ToList();
+        if (files.Count > 0)
         {
             sb.AppendLine("## Files to Investigate");
-            foreach (var file in v.FilesToInvestigate)
+            foreach (var file in files)
                 sb.AppendLine($"- `{file}`");
             sb.AppendLine();
         }
@@ -249,6 +493,36 @@ public sealed class IssueFiler : IIssueFiler
             sb.AppendLine("## Recommendation");
             sb.AppendLine(recommendation);
             sb.AppendLine();
+        }
+
+        // Merged GlitchTip errors (same root cause, split by GlitchTip)
+        if (outcome.MergedOutcomes.Count > 0)
+        {
+            sb.AppendLine("## Merged GlitchTip Errors");
+            sb.AppendLine("GlitchTip reported the following errors separately; GlitchPilot identified them as the same root cause. " +
+                          "**The fix must cover every call site below**, not only the one from the main stack trace.");
+            if (!string.IsNullOrWhiteSpace(outcome.MergeReason))
+            {
+                sb.AppendLine();
+                sb.AppendLine($"> {SafeMarkdown(outcome.MergeReason)}");
+            }
+            sb.AppendLine();
+            foreach (var m in outcome.MergedOutcomes)
+            {
+                var mc = m.Candidate;
+                sb.AppendLine($"### [GlitchTip #{mc.ErrorId}]({mc.GlitchTipLink}) — {SafeMarkdown(mc.ErrorTitle)} ({mc.Occurrences}×)");
+                sb.AppendLine($"- **Source**: {mc.SourceLocation ?? "—"}");
+                if (mc.FunctionName is not null) sb.AppendLine($"- **Function**: {mc.FunctionName}");
+                if (mc.HttpEndpoint is not null) sb.AppendLine($"- **Endpoint**: {mc.HttpEndpoint}");
+                if (mc.StackTrace is not null)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("```");
+                    sb.AppendLine(string.Join('\n', mc.StackTrace.Split('\n').Take(25)));
+                    sb.AppendLine("```");
+                }
+                sb.AppendLine();
+            }
         }
 
         sb.AppendLine("---");

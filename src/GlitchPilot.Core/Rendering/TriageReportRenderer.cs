@@ -35,8 +35,17 @@ public static class TriageReportRenderer
     public static string RenderSummary(string projectSlug, List<TriageOutcome> outcomes,
         string environment = "", int minOccurrences = 1, int lookbackHours = 24)
     {
-        var actionable = outcomes.Where(o => o.Verdict.RequiresAction).ToList();
+        // Merged errors are rendered inside their primary's card, not on their own
+        var actionable = outcomes.Where(o => o.Verdict.RequiresAction && o.MergedInto is null && o.DuplicateOf is null).ToList();
+        var known = outcomes.Where(o => o.Verdict.RequiresAction && o.MergedInto is null && o.DuplicateOf is not null).ToList();
+        var mergedCount = outcomes.Count(o => o.MergedInto is not null);
         var dismissed = outcomes.Where(o => !o.Verdict.RequiresAction).ToList();
+
+        var counts = new List<string> { $"{actionable.Count} actionable" };
+        if (known.Count > 0) counts.Add($"{known.Count} already known");
+        if (mergedCount > 0) counts.Add($"{mergedCount} merged");
+        counts.Add($"{dismissed.Count} dismissed");
+        counts.Add($"{outcomes.Count} total");
 
         var html = new StringBuilder();
         html.Append($"""
@@ -49,7 +58,7 @@ public static class TriageReportRenderer
               <tr><td style="background:linear-gradient(135deg,#0f172a,#1e293b);padding:28px 36px;">
                 <h1 style="margin:0;color:#f8fafc;font-size:22px;font-weight:600;">GlitchPilot: {Esc(projectSlug)}</h1>
                 <p style="color:#94a3b8;font-size:13px;margin:6px 0 0;">
-                  {actionable.Count} actionable · {dismissed.Count} dismissed · {outcomes.Count} total
+                  {string.Join(" · ", counts)}
                 </p>
               </td></tr>
               <tr><td style="padding:28px 36px;">
@@ -68,6 +77,7 @@ public static class TriageReportRenderer
                 var summary = !string.IsNullOrWhiteSpace(o.Verdict.EmailSummary)
                     ? o.Verdict.EmailSummary : o.Verdict.Explanation;
                 var ghLine = BuildGitHubStatusLine(o);
+                var mergedLine = BuildMergedLine(o);
 
                 html.Append($"""
                     <div style="background:#f8fafc;border-left:4px solid {accent};border-radius:8px;padding:14px 16px;margin-bottom:12px;">
@@ -81,7 +91,39 @@ public static class TriageReportRenderer
                       <div style="font-size:13px;color:#475569;margin-top:8px;line-height:1.5;">
                         {Esc(summary)}
                       </div>
+                      {mergedLine}
                       {ghLine}
+                    </div>
+                    """);
+            }
+        }
+
+        // Errors matched to already open GitHub work — no new issue, no new Copilot run
+        if (known.Count > 0)
+        {
+            html.Append($"<h2 style=\"font-size:16px;color:#7c3aed;margin:24px 0 8px;\">Already Known ({known.Count})</h2>");
+            html.Append("<p style=\"font-size:12px;color:#64748b;margin:0 0 12px;\">These problems occurred before and an open issue or pull request already exists. No new issue was filed and no Copilot run was started.</p>");
+
+            foreach (var o in known)
+            {
+                var title = !string.IsNullOrWhiteSpace(o.Verdict.IssueTitle)
+                    ? o.Verdict.IssueTitle : o.Candidate.ErrorTitle;
+                var summary = !string.IsNullOrWhiteSpace(o.Verdict.EmailSummary)
+                    ? o.Verdict.EmailSummary : o.Verdict.Explanation;
+
+                html.Append($"""
+                    <div style="background:#faf5ff;border-left:4px solid #7c3aed;border-radius:8px;padding:14px 16px;margin-bottom:12px;">
+                      <div style="font-size:14px;font-weight:600;color:#0f172a;">
+                        <a href="{Esc(o.Candidate.GlitchTipLink)}" style="color:#0f172a;text-decoration:none;">[#{Esc(o.Candidate.ErrorId)}] {Esc(title)}</a>
+                      </div>
+                      <div style="font-size:12px;color:#94a3b8;margin-top:4px;">
+                        {Esc(o.Verdict.Priority)} · {Esc(o.Verdict.ErrorType)} · {o.Candidate.Occurrences}x · {Esc(o.Candidate.SourceLocation ?? "—")}
+                      </div>
+                      <div style="font-size:13px;color:#475569;margin-top:8px;line-height:1.5;">
+                        {Esc(summary)}
+                      </div>
+                      {BuildMergedLine(o)}
+                      {BuildKnownLine(o.DuplicateOf!)}
                     </div>
                     """);
             }
@@ -134,7 +176,14 @@ public static class TriageReportRenderer
 
     private static string BuildGitHubStatusLine(TriageOutcome o)
     {
-        if (!o.GitHubIssueNumber.HasValue) return "";
+        if (!o.GitHubIssueNumber.HasValue)
+        {
+            return string.IsNullOrWhiteSpace(o.GitHubError) ? "" : $"""
+                <div style="font-size:12px;margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;color:#dc2626;">
+                  &#9888; No GitHub issue: {Esc(o.GitHubError)}
+                </div>
+                """;
+        }
 
         var issueUrl = o.GitHubIssueUrl ?? "";
         return $"""
@@ -142,6 +191,58 @@ public static class TriageReportRenderer
               <a href="{Esc(issueUrl)}" style="color:#3b82f6;text-decoration:none;">GitHub issue #{o.GitHubIssueNumber}</a>
             </div>
             """;
+    }
+
+    private static string BuildMergedLine(TriageOutcome o)
+    {
+        if (o.MergedOutcomes.Count == 0) return "";
+
+        var links = string.Join(", ", o.MergedOutcomes.Select(m =>
+            $"<a href=\"{Esc(m.Candidate.GlitchTipLink)}\" style=\"color:#3b82f6;text-decoration:none;\">#{Esc(m.Candidate.ErrorId)}</a> ({m.Candidate.Occurrences}x)"));
+        var reason = string.IsNullOrWhiteSpace(o.MergeReason)
+            ? "" : $"<div style=\"color:#94a3b8;margin-top:2px;\">{Esc(o.MergeReason)}</div>";
+        var n = o.MergedOutcomes.Count;
+
+        return $"""
+            <div style="font-size:12px;color:#475569;margin-top:8px;padding:6px 8px;background:#eef2ff;border-radius:6px;">
+              &#128279; Merged {n} GlitchTip {Plural(n, "duplicate")} (same root cause, one fix): {links}
+              {reason}
+            </div>
+            """;
+    }
+
+    private static string BuildKnownLine(KnownDuplicate known)
+    {
+        var kind = known.IsPullRequest ? "pull request" : "issue";
+        var prs = known.PullRequests.Count == 0
+            ? (known.IsPullRequest || !known.PullRequestsKnown ? "" : " · no open pull request")
+            : " · " + string.Join(", ", known.PullRequests.Select(pr =>
+                $"<a href=\"{Esc(pr.Url)}\" style=\"color:#3b82f6;text-decoration:none;\">PR #{pr.Number}</a>{(pr.Draft ? " (draft)" : "")} not merged"));
+        var reason = string.IsNullOrWhiteSpace(known.Reason)
+            ? "" : $"<div style=\"color:#94a3b8;margin-top:2px;\">{Esc(known.Reason)}</div>";
+
+        return $"""
+            <div style="font-size:12px;margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;color:#475569;">
+              &#128257; Occurred before — matches open {kind}
+              <a href="{Esc(known.Url)}" style="color:#3b82f6;text-decoration:none;">#{known.Number}</a>
+              (open since {known.CreatedAt.ToLocalTime():yyyy-MM-dd}, {Age(known.CreatedAt)}){prs}
+              {reason}
+            </div>
+            """;
+    }
+
+    internal static string Age(DateTimeOffset since, DateTimeOffset? now = null)
+    {
+        var days = (int)((now ?? DateTimeOffset.UtcNow) - since).TotalDays;
+        return days switch
+        {
+            < 1 => "today",
+            1 => "1 day",
+            < 14 => $"{days} days",
+            < 60 => $"{days / 7} weeks",
+            < 365 => $"{days / 30} months",
+            _ => days / 365 == 1 ? "1 year" : $"{days / 365} years",
+        };
     }
 
     private static string PriorityColor(string priority) => priority switch

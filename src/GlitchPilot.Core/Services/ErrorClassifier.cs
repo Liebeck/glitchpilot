@@ -1,16 +1,12 @@
 using System.Text.Json;
-using Azure;
-using Azure.AI.OpenAI;
-using GlitchPilot.Core.Configuration;
 using GlitchPilot.Core.Models;
 using Microsoft.Extensions.Logging;
-using OpenAI.Chat;
 
 namespace GlitchPilot.Core.Services;
 
 public sealed class ErrorClassifier : IErrorClassifier
 {
-    private readonly ChatClient _chat;
+    private readonly IChatCompleter _chat;
     private readonly ILogger<ErrorClassifier> _log;
 
     private static readonly string s_systemInstruction = """
@@ -78,13 +74,10 @@ public sealed class ErrorClassifier : IErrorClassifier
           Bad: "Review database server logs and network configuration." (not a code change)
         """;
 
-    public ErrorClassifier(ILogger<ErrorClassifier> log)
+    public ErrorClassifier(IChatCompleter chat, ILogger<ErrorClassifier> log)
     {
+        _chat = chat;
         _log = log;
-        var aoai = new AzureOpenAIClient(
-            new Uri(EnvironmentConfig.OpenAiEndpoint),
-            new AzureKeyCredential(EnvironmentConfig.OpenAiApiKey));
-        _chat = aoai.GetChatClient(EnvironmentConfig.OpenAiModel);
     }
 
     public async Task<Verdict> EvaluateAsync(TriageCandidate candidate, CancellationToken ct = default)
@@ -122,18 +115,14 @@ public sealed class ErrorClassifier : IErrorClassifier
 
         try
         {
-            var completion = await _chat.CompleteChatAsync(
-                [new SystemChatMessage(s_systemInstruction), new UserChatMessage(prompt)],
-                cancellationToken: ct);
-
-            var json = completion.Value.Content[0].Text;
+            var json = await _chat.CompleteAsync(s_systemInstruction, prompt, ct);
 
             return JsonSerializer.Deserialize<Verdict>(json, new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true,
             }) ?? FallbackVerdict("Unparseable AI response");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             _log.LogWarning(ex, "Classification failed for error {ErrorId}", candidate.ErrorId);
             return FallbackVerdict(ex.Message);

@@ -8,9 +8,10 @@ GlitchPilot connects your [GlitchTip](https://glitchtip.com) error tracker to AI
 
 1. **Scans** error groups from GlitchTip (configurable lookback window)
 2. **Classifies** each error with Azure OpenAI — actionable or noise, severity, error type
-3. **Files GitHub issues** with structured problem descriptions, acceptance criteria, and fix recommendations
-4. **Assigns Copilot** coding agent to immediately start working on fixes
-5. **Sends email** — per-project summary of all classified errors with links to GitHub issues
+3. **Merges duplicates** — errors GlitchTip split into several groups are merged into one issue; optionally, errors that match an already open issue / PR are not filed again
+4. **Files GitHub issues** with structured problem descriptions, acceptance criteria, and fix recommendations
+5. **Assigns Copilot** coding agent to immediately start working on fixes
+6. **Sends email** — per-project summary of all classified errors with links to GitHub issues
 
 ### How to run it
 
@@ -25,7 +26,11 @@ GlitchPilot connects your [GlitchTip](https://glitchtip.com) error tracker to AI
 flowchart LR
     A[GlitchTip] -->|Scan errors| B[Azure OpenAI]
     B -->|Classify| C{Actionable?}
-    C -->|Yes| D[GitHub Issue]
+    C -->|Yes| M[Merge duplicates]
+    M --> K{Already open on GitHub?}
+    K -->|Yes| L[Comment on existing issue]
+    K -->|No| D[GitHub Issue]
+    L --> G
     D --> E[Copilot Agent]
     C -->|No| F[Dismissed]
     D --> G[Email Summary]
@@ -65,9 +70,21 @@ dotnet run --project src/GlitchPilot.Console -- --mode verify
 
 ---
 
+## Duplicate Handling
+
+GlitchTip sometimes splits one bug into several error groups (variable data in messages, different call sites, wrapped exceptions). Without deduplication every group would trigger its own Copilot run. GlitchPilot deduplicates in three stages per project:
+
+1. **Merge within a run** (`MERGE_DUPLICATES_ENABLED`, default `true`): After classification, all actionable errors of a project are sent to Azure OpenAI in one request, which groups errors that share a root cause. Each group gets **one** GitHub issue (the error with the highest priority, then most occurrences, is the primary). The issue carries `glitchtip:{id}` labels for **all** merged errors and lists them under "Merged GlitchTip Errors". The email shows the merged errors below the primary.
+2. **Label check**: GlitchPilot searches the repository (GitHub search API, open issues and PRs) for the `glitchtip:{id}` labels of all actionable errors of the run — independent of any other labels. If any error of a group already has an open issue or PR with its label, no new issue is filed; the labels of newly merged errors are added and the error is listed under "Already Known". If GitHub cannot be queried, no issues are filed for that project in this run (to avoid duplicate Copilot runs); the email says so.
+3. **History scan** (`DUPLICATE_SCAN_ENABLED`, default `false`): Remaining groups are compared with open GlitchPilot issues (up to `DUPLICATE_SCAN_MAX_ISSUES`) and open pull requests of the repository — e.g. a fix from three months ago that was never merged. Only high-confidence matches count. For a match GlitchPilot files **no** issue and starts **no** Copilot run; instead it adds the `glitchtip:{id}` labels, the first `GITHUB_LABELS` label and a recurrence comment to the existing issue / PR (so the next run finds it via the label check and no further comment is posted) and lists the error under "Already Known" in the email (with link, age, linked PRs and the AI's reasoning).
+
+Boolean settings accept `true/false`, `1/0`, `yes/no`, `on/off`; any other value stops the run with an error. All AI deduplication steps fail open: if Azure OpenAI is unavailable or answers with invalid JSON, GlitchPilot behaves as without deduplication.
+
+---
+
 ## GitHub Issue Filing
 
-- **Duplicate detection**: Label `glitchtip:{errorId}` — checked before creating
+- **Duplicate detection**: Label `glitchtip:{errorId}` — checked before creating (see [Duplicate Handling](#duplicate-handling))
 - **Issue body**: Problem description, acceptance criteria, files to investigate, stack trace, breadcrumbs, error details, tags, recommendation
 - **Labels**: `glitchpilot`, `glitchtip:{errorId}`, `priority:{level}`, `type:{type}`, optional agent label
 - **Copilot assignment**: Assigns `copilot-swe-agent[bot]` via GitHub API after issue creation
@@ -76,7 +93,7 @@ dotnet run --project src/GlitchPilot.Console -- --mode verify
 
 ## Email Templates
 
-- **Triage summary** (per project): Actionable issues with priority badges, OpenAI summaries, and GitHub issue links. Dismissed issues shown separately. Footer with filter settings.
+- **Triage summary** (per project): Actionable issues with priority badges, OpenAI summaries, and GitHub issue links. Merged duplicates are listed below their primary issue. Errors matched to open GitHub work appear under "Already Known". Dismissed issues shown separately. Footer with filter settings.
 - **All clear** (per project): Green checkmark, no issues need attention.
 - Timestamps use local time (`DateTimeOffset.Now`)
 
@@ -108,6 +125,9 @@ dotnet run --project src/GlitchPilot.Console -- --mode verify
 | `LOOKBACK_HOURS` | no | `24` | Hours to look back for errors |
 | `EXCLUDE_TITLES` | no | | Comma-separated title patterns to skip |
 | `EXCLUDE_IDS` | no | | Comma-separated GlitchTip IDs to skip |
+| `MERGE_DUPLICATES_ENABLED` | no | `true` | Merge errors of one run with the same root cause into one issue |
+| `DUPLICATE_SCAN_ENABLED` | no | `false` | Compare new errors with open GitHub issues / PRs before filing |
+| `DUPLICATE_SCAN_MAX_ISSUES` | no | `50` | Max. open issues per repository considered by the history scan |
 | `TRIAGE_SCHEDULE` | no | `0 0 5 * * *` | Cron schedule (Azure Function only) |
 
 ### PROJECTS format
@@ -133,6 +153,14 @@ Each entry maps a GlitchTip project to a GitHub repository:
 
 ---
 
+## Tests
+
+```bash
+dotnet test GlitchPilot.slnx
+```
+
+---
+
 ## DI Registration
 
 All services are registered via `services.AddGlitchPilot()` in `Registration.cs`:
@@ -141,6 +169,8 @@ All services are registered via `services.AddGlitchPilot()` in `Registration.cs`
 services.AddHttpClient<IGlitchTipClient, GlitchTipClient>();
 services.AddSingleton<IErrorClassifier, ErrorClassifier>();
 services.AddSingleton<IIssueFiler, IssueFiler>();
+services.AddSingleton<IChatCompleter, AzureChatCompleter>();
+services.AddSingleton<IDuplicateDetector, DuplicateDetector>();
 services.AddSingleton<ISmtpMailer, SmtpMailer>();
 services.AddTransient<TriagePipeline>();
 services.AddTransient<VerifyPipeline>();
