@@ -40,6 +40,7 @@ public sealed class TriagePipeline
             EnvironmentConfig.MergeDuplicatesEnabled,
             EnvironmentConfig.DuplicateScanEnabled,
             EnvironmentConfig.DuplicateScanMaxIssues);
+        var manualFiling = EnvironmentConfig.ManualFiling;
         _log.LogInformation("Triage started — lookback {H}h, merge duplicates: {Merge}, history scan: {Scan}",
             lookbackHours, dedup.MergeEnabled, dedup.HistoryScanEnabled);
 
@@ -95,7 +96,7 @@ public sealed class TriagePipeline
             outcomes.AddRange(projectOutcomes);
         }
 
-        await SendNotificationAsync(outcomes, lookbackHours, ct);
+        await SendNotificationAsync(outcomes, lookbackHours, BuildFileIssueLink(manualFiling), ct);
 
         _log.LogInformation(
             "Triage done — {Total} scanned, {Actionable} actionable, {Merged} merged, {Known} already known",
@@ -281,8 +282,18 @@ public sealed class TriagePipeline
     internal static bool IsNewActionable(TriageOutcome o) =>
         o.Verdict.RequiresAction && o.MergedInto is null && o.DuplicateOf is null;
 
+    /// <summary>Signed link for the "Create GitHub issue" button, or null when the feature is not configured.</summary>
+    internal static Func<TriageOutcome, string>? BuildFileIssueLink(ManualFilingSettings? settings)
+    {
+        if (settings is null) return null;
+        var expires = DateTimeOffset.UtcNow.AddDays(settings.ExpiryDays);
+        return o => IssueLinks.Build(settings.Endpoint, settings.SigningKey,
+            o.Candidate.ProjectSlug, o.Candidate.ErrorId, expires);
+    }
+
     private async Task SendNotificationAsync(
-        List<TriageOutcome> outcomes, int lookbackHours, CancellationToken ct)
+        List<TriageOutcome> outcomes, int lookbackHours, Func<TriageOutcome, string>? fileIssueLink,
+        CancellationToken ct)
     {
         var byProject = outcomes
             .GroupBy(o => o.Candidate.ProjectSlug)
@@ -303,7 +314,7 @@ public sealed class TriagePipeline
 
             var environment = items.FirstOrDefault()?.Candidate.Environment ?? "—";
             var body = TriageReportRenderer.RenderSummary(slug, items,
-                environment, EnvironmentConfig.MinOccurrences, lookbackHours);
+                environment, EnvironmentConfig.MinOccurrences, lookbackHours, fileIssueLink);
 
             try
             {

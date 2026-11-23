@@ -48,6 +48,30 @@ public static class EnvironmentConfig
     /// <summary>Maximum number of open issues per repository considered by the history scan.</summary>
     public static int DuplicateScanMaxIssues => ReadPositiveInt("DUPLICATE_SCAN_MAX_ISSUES", 50);
 
+    // ── Manual filing (button in the email) ────────────────
+    /// <summary>
+    /// Settings for the "Create GitHub issue" button on dismissed transient errors, or null when
+    /// FILE_ISSUE_URL is not set (no button). Throws if the URL is set but the signing key is missing or weak.
+    /// </summary>
+    public static ManualFilingSettings? ManualFiling
+    {
+        get
+        {
+            var url = Read("FILE_ISSUE_URL");
+            if (string.IsNullOrWhiteSpace(url)) return null;
+            if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps && !uri.IsLoopback)
+                throw new InvalidOperationException(
+                    $"Environment variable 'FILE_ISSUE_URL' has invalid value '{url}'. Use an absolute https URL.");
+
+            var key = Read("LINK_SIGNING_KEY");
+            if (string.IsNullOrWhiteSpace(key) || key.Trim().Length < 32)
+                throw new InvalidOperationException(
+                    "Environment variable 'LINK_SIGNING_KEY' must be set to at least 32 characters when FILE_ISSUE_URL is set.");
+
+            return new ManualFilingSettings(url.Trim(), key.Trim(), ReadPositiveInt("LINK_EXPIRY_DAYS", 14));
+        }
+    }
+
     // ── General ────────────────────────────────────────────
     public static int LookbackHours         => int.Parse(Read("LOOKBACK_HOURS") ?? "24");
 
@@ -91,3 +115,6 @@ public static class EnvironmentConfig
             .ToList();
     }
 }
+
+/// <summary>Endpoint, HMAC key and link lifetime for the manual "Create GitHub issue" button.</summary>
+public sealed record ManualFilingSettings(string Endpoint, string SigningKey, int ExpiryDays);

@@ -67,6 +67,7 @@ dotnet run --project src/GlitchPilot.Console -- --mode verify
 - Set `WEBSITE_TIME_ZONE` in Azure Portal for local timezone support
 - All other config comes from Azure Function App Settings (same env vars as `.env`)
 - Runs on Consumption plan (executes in under a few minutes)
+- `FileIssue` (HTTP, `GET/POST /api/file-issue`) serves the "Create GitHub issue anyway" button from the email (see [Filing Dismissed Errors Manually](#filing-dismissed-errors-manually))
 
 ---
 
@@ -82,6 +83,18 @@ Boolean settings accept `true/false`, `1/0`, `yes/no`, `on/off`; any other value
 
 ---
 
+## Filing Dismissed Errors Manually
+
+Transient errors with few occurrences are dismissed and get no issue. If you know they should be fixed anyway, the email shows a **Create GitHub issue anyway** button on every dismissed error of type `transient`. No GitHub login is needed:
+
+1. The button opens a confirmation page served by the `FileIssue` function. Opening it changes nothing (mail scanners prefetch links), but it shows whether the error is already tracked.
+2. Optionally describe how it should be fixed — the notes go into the issue under "Notes from the Team", above the AI recommendation, so Copilot follows them.
+3. **Create GitHub issue** loads the error from GlitchTip again, re-classifies it for fresh issue text and files it like any other issue (labels, `glitchtip:{id}`, Copilot assignment) in the repository configured in `PROJECTS`. If an open issue / PR already carries its label, or GitHub cannot be queried, nothing is filed.
+
+The link is signed with HMAC-SHA256 (`LINK_SIGNING_KEY`) and expires after `LINK_EXPIRY_DAYS`. The signature is the only authorization: anyone holding an unexpired link from the email can file that one error, so treat the email accordingly. The button only appears when `FILE_ISSUE_URL` is set — in the Console as well, but the link always points at the deployed function. Generate a key e.g. with `openssl rand -base64 48`; rotating it invalidates all links sent so far.
+
+---
+
 ## GitHub Issue Filing
 
 - **Duplicate detection**: Label `glitchtip:{errorId}` — checked before creating (see [Duplicate Handling](#duplicate-handling))
@@ -93,7 +106,7 @@ Boolean settings accept `true/false`, `1/0`, `yes/no`, `on/off`; any other value
 
 ## Email Templates
 
-- **Triage summary** (per project): Actionable issues with priority badges, OpenAI summaries, and GitHub issue links. Merged duplicates are listed below their primary issue. Errors matched to open GitHub work appear under "Already Known". Dismissed issues shown separately. Footer with filter settings.
+- **Triage summary** (per project): Actionable issues with priority badges, OpenAI summaries, and GitHub issue links. Merged duplicates are listed below their primary issue. Errors matched to open GitHub work appear under "Already Known". Dismissed issues shown separately — transient ones with a "Create GitHub issue anyway" button when `FILE_ISSUE_URL` is set. Footer with filter settings.
 - **All clear** (per project): Green checkmark, no issues need attention.
 - Timestamps use local time (`DateTimeOffset.Now`)
 
@@ -128,6 +141,9 @@ Boolean settings accept `true/false`, `1/0`, `yes/no`, `on/off`; any other value
 | `MERGE_DUPLICATES_ENABLED` | no | `true` | Merge errors of one run with the same root cause into one issue |
 | `DUPLICATE_SCAN_ENABLED` | no | `false` | Compare new errors with open GitHub issues / PRs before filing |
 | `DUPLICATE_SCAN_MAX_ISSUES` | no | `50` | Max. open issues per repository considered by the history scan |
+| `FILE_ISSUE_URL` | no | | Full URL of the `FileIssue` function, e.g. `https://<app>.azurewebsites.net/api/file-issue`. Enables the button for dismissed transient errors |
+| `LINK_SIGNING_KEY` | if `FILE_ISSUE_URL` | | Secret (≥ 32 chars) that signs the button links; same value for triage and function |
+| `LINK_EXPIRY_DAYS` | no | `14` | Days a button link stays valid |
 | `TRIAGE_SCHEDULE` | no | `0 0 5 * * *` | Cron schedule (Azure Function only) |
 
 ### PROJECTS format
@@ -172,6 +188,7 @@ services.AddSingleton<IIssueFiler, IssueFiler>();
 services.AddSingleton<IChatCompleter, AzureChatCompleter>();
 services.AddSingleton<IDuplicateDetector, DuplicateDetector>();
 services.AddSingleton<ISmtpMailer, SmtpMailer>();
+services.AddTransient<ManualFilingService>();
 services.AddTransient<TriagePipeline>();
 services.AddTransient<VerifyPipeline>();
 services.AddTransient<ProbePipeline>();
@@ -189,6 +206,7 @@ Both `Program.cs` files (Console and Functions) call the same `AddGlitchPilot()`
 | `MailKit` | SMTP email delivery (STARTTLS) |
 | `Octokit` | GitHub issue creation and label queries |
 | `Microsoft.Azure.Functions.Worker` | Azure Functions isolated worker (Functions project only) |
+| `Microsoft.Azure.Functions.Worker.Extensions.Http` | HTTP trigger for the "Create GitHub issue" button (Functions project only) |
 
 ---
 

@@ -63,7 +63,7 @@ internal sealed class FakeGlitchTip(List<TriageCandidate> candidates) : IGlitchT
         DateTimeOffset? since = null, CancellationToken ct = default) => Task.FromResult(candidates);
 
     public Task<TriageCandidate?> GetIssueAsync(string issueId, CancellationToken ct = default) =>
-        Task.FromResult<TriageCandidate?>(null);
+        Task.FromResult(candidates.FirstOrDefault(c => c.ErrorId == issueId));
 }
 
 internal sealed class FakeClassifier : IErrorClassifier

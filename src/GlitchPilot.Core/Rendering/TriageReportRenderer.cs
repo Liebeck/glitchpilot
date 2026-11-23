@@ -33,7 +33,8 @@ public static class TriageReportRenderer
         """;
 
     public static string RenderSummary(string projectSlug, List<TriageOutcome> outcomes,
-        string environment = "", int minOccurrences = 1, int lookbackHours = 24)
+        string environment = "", int minOccurrences = 1, int lookbackHours = 24,
+        Func<TriageOutcome, string>? fileIssueLink = null)
     {
         // Merged errors are rendered inside their primary's card, not on their own
         var actionable = outcomes.Where(o => o.Verdict.RequiresAction && o.MergedInto is null && o.DuplicateOf is null).ToList();
@@ -152,6 +153,7 @@ public static class TriageReportRenderer
                       <div style="font-size:13px;color:#94a3b8;margin-top:8px;line-height:1.5;">
                         {Esc(summary)}
                       </div>
+                      {BuildFileIssueButton(o, fileIssueLink)}
                     </div>
                     """);
             }
@@ -189,6 +191,22 @@ public static class TriageReportRenderer
         return $"""
             <div style="font-size:12px;margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;">
               <a href="{Esc(issueUrl)}" style="color:#3b82f6;text-decoration:none;">GitHub issue #{o.GitHubIssueNumber}</a>
+            </div>
+            """;
+    }
+
+    /// <summary>Dismissed transient errors can still be filed by hand from the email.</summary>
+    internal static bool CanFileManually(TriageOutcome o) =>
+        !o.Verdict.RequiresAction &&
+        o.Verdict.ErrorType.Equals("transient", StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildFileIssueButton(TriageOutcome o, Func<TriageOutcome, string>? fileIssueLink)
+    {
+        if (fileIssueLink is null || !CanFileManually(o)) return "";
+
+        return $"""
+            <div style="margin-top:10px;">
+              <a href="{Esc(fileIssueLink(o))}" style="display:inline-block;background:#0f172a;color:#ffffff;border-radius:6px;padding:7px 14px;font-size:12px;font-weight:600;text-decoration:none;">Create GitHub issue anyway</a>
             </div>
             """;
     }

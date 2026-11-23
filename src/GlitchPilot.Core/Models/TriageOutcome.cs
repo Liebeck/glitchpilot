@@ -30,6 +30,12 @@ public class TriageOutcome
     /// </summary>
     public KnownDuplicate? DuplicateOf { get; set; }
 
+    /// <summary>True when a person filed this issue from the email button although GlitchPilot dismissed the error.</summary>
+    public bool FiledManually { get; set; }
+
+    /// <summary>Optional notes the person entered on the confirmation page (e.g. how to fix it).</summary>
+    public string? ManualNotes { get; set; }
+
     /// <summary>All GlitchTip error IDs represented by this outcome (itself + merged ones).</summary>
     public IEnumerable<string> AllErrorIds =>
         new[] { Candidate.ErrorId }.Concat(MergedOutcomes.Select(m => m.Candidate.ErrorId));

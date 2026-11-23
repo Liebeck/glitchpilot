@@ -13,7 +13,8 @@ public class EnvCollection;
 public class TriagePipelineTests : IDisposable
 {
     private static readonly string[] s_vars =
-        ["PROJECTS", "MERGE_DUPLICATES_ENABLED", "DUPLICATE_SCAN_ENABLED", "DUPLICATE_SCAN_MAX_ISSUES", "LOOKBACK_HOURS", "MIN_OCCURRENCES"];
+        ["PROJECTS", "MERGE_DUPLICATES_ENABLED", "DUPLICATE_SCAN_ENABLED", "DUPLICATE_SCAN_MAX_ISSUES", "LOOKBACK_HOURS", "MIN_OCCURRENCES",
+         "FILE_ISSUE_URL", "LINK_SIGNING_KEY", "LINK_EXPIRY_DAYS"];
 
     private readonly Dictionary<string, string?> _saved = s_vars.ToDictionary(v => v, Environment.GetEnvironmentVariable);
 
@@ -23,6 +24,8 @@ public class TriagePipelineTests : IDisposable
             """[{"slug":"app","targetEnvironment":"Production","gitHubOwner":"org","gitHubRepo":"repo"}]""");
         Environment.SetEnvironmentVariable("MERGE_DUPLICATES_ENABLED", null);
         Environment.SetEnvironmentVariable("DUPLICATE_SCAN_ENABLED", null);
+        Environment.SetEnvironmentVariable("FILE_ISSUE_URL", null);
+        Environment.SetEnvironmentVariable("LINK_SIGNING_KEY", null);
     }
 
     public void Dispose()

@@ -25,6 +25,7 @@ public static class Registration
         services.AddSingleton<IChatCompleter, AzureChatCompleter>();
         services.AddSingleton<IDuplicateDetector, DuplicateDetector>();
         services.AddSingleton<ISmtpMailer, SmtpMailer>();
+        services.AddTransient<ManualFilingService>();
         services.AddTransient<TriagePipeline>();
         services.AddTransient<VerifyPipeline>();
         services.AddTransient<ProbePipeline>();

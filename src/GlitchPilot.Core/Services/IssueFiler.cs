@@ -399,6 +399,25 @@ public sealed partial class IssueFiler : IIssueFiler
         var v = outcome.Verdict;
         var sb = new System.Text.StringBuilder();
 
+        // Manually requested from the email although GlitchPilot dismissed the error
+        if (outcome.FiledManually)
+        {
+            sb.AppendLine("> [!NOTE]");
+            sb.AppendLine("> Filed manually from the GlitchPilot email. GlitchPilot had dismissed this error " +
+                          $"(type: {v.ErrorType}), but a team member asked for a fix.");
+            sb.AppendLine();
+        }
+
+        if (!string.IsNullOrWhiteSpace(outcome.ManualNotes))
+        {
+            sb.AppendLine("## Notes from the Team");
+            sb.AppendLine("Written by someone who knows this codebase. Where they disagree with the recommendation below, follow these notes.");
+            sb.AppendLine();
+            // Keep line breaks, but do not let the notes @-mention people
+            sb.AppendLine(outcome.ManualNotes.Replace("\r", "").Trim().Replace("@", "@​"));
+            sb.AppendLine();
+        }
+
         // Problem
         var problem = string.IsNullOrWhiteSpace(v.ProblemDescription)
             ? v.Explanation : v.ProblemDescription;
