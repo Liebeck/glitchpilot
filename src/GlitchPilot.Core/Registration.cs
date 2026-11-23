@@ -26,6 +26,9 @@ public static class Registration
         services.AddSingleton<IDuplicateDetector, DuplicateDetector>();
         services.AddSingleton<ISmtpMailer, SmtpMailer>();
         services.AddTransient<ManualFilingService>();
+        services.AddSingleton<IRunStore, BlobRunStore>();
+        services.AddSingleton<ICopilotUsageClient, CopilotUsageClient>();
+        services.AddTransient<ReportPipeline>();
         services.AddTransient<TriagePipeline>();
         services.AddTransient<VerifyPipeline>();
         services.AddTransient<ProbePipeline>();

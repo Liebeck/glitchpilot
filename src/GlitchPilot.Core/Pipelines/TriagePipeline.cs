@@ -13,7 +13,8 @@ public sealed class TriagePipeline
     private readonly IErrorClassifier _classifier;
     private readonly IIssueFiler _issueFiler;
     private readonly IDuplicateDetector _duplicates;
-    private readonly ISmtpMailer _mailer;
+    private readonly IRunStore _store;
+    private readonly ReportPipeline _report;
     private readonly ILogger<TriagePipeline> _log;
 
     public TriagePipeline(
@@ -21,14 +22,16 @@ public sealed class TriagePipeline
         IErrorClassifier classifier,
         IIssueFiler issueFiler,
         IDuplicateDetector duplicates,
-        ISmtpMailer mailer,
+        IRunStore store,
+        ReportPipeline report,
         ILogger<TriagePipeline> log)
     {
         _client = client;
         _classifier = classifier;
         _issueFiler = issueFiler;
         _duplicates = duplicates;
-        _mailer = mailer;
+        _store = store;
+        _report = report;
         _log = log;
     }
 
@@ -43,6 +46,16 @@ public sealed class TriagePipeline
         var manualFiling = EnvironmentConfig.ManualFiling;
         _log.LogInformation("Triage started — lookback {H}h, merge duplicates: {Merge}, history scan: {Scan}",
             lookbackHours, dedup.MergeEnabled, dedup.HistoryScanEnabled);
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var run = new RunRecord
+        {
+            RunId = $"{startedAt:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..6]}",
+            StartedAt = startedAt,
+            LookbackHours = lookbackHours,
+        };
+        // Before any issue is filed (= before Copilot starts), so the report can subtract earlier usage of the day
+        await _report.SnapshotBillingAsync(run, ct);
 
         var cutoff = DateTimeOffset.UtcNow.AddHours(-lookbackHours);
         var projects = await _client.ListProjectsAsync(ct);
@@ -94,9 +107,12 @@ public sealed class TriagePipeline
             await ResolveAndFileAsync(monitored, projectOutcomes, dedup, ct);
 
             outcomes.AddRange(projectOutcomes);
+            run.Projects.Add(DescribeProject(match.Slug, monitored, projectOutcomes));
         }
 
-        await SendNotificationAsync(outcomes, lookbackHours, BuildFileIssueLink(manualFiling), ct);
+        run.FiledAt = DateTimeOffset.UtcNow;
+        run.Emails = BuildEmails(outcomes, lookbackHours, BuildFileIssueLink(manualFiling));
+        await DeliverAsync(run, ct);
 
         _log.LogInformation(
             "Triage done — {Total} scanned, {Actionable} actionable, {Merged} merged, {Known} already known",
@@ -291,10 +307,69 @@ public sealed class TriagePipeline
             o.Candidate.ProjectSlug, o.Candidate.ErrorId, expires);
     }
 
-    private async Task SendNotificationAsync(
-        List<TriageOutcome> outcomes, int lookbackHours, Func<TriageOutcome, string>? fileIssueLink,
-        CancellationToken ct)
+    /// <summary>
+    /// With usage storage the emails wait until the Copilot sessions finished (sent by <see cref="ReportPipeline"/>);
+    /// without storage — or if storing fails — they are sent right away with the Azure OpenAI usage only.
+    /// </summary>
+    private async Task DeliverAsync(RunRecord run, CancellationToken ct)
     {
+        if (_store.IsEnabled)
+        {
+            var stored = false;
+            try
+            {
+                await _store.SavePendingAsync(run, ct);
+                stored = true;
+                if (!await _report.TryReportAsync(run, ct: ct))
+                    _log.LogInformation("Run {RunId}: triage email will be sent with the Copilot usage once the sessions finished (max {Max} min)",
+                        run.RunId, EnvironmentConfig.ReportMaxDelayMinutes);
+                return;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && stored)
+            {
+                // The run is stored: the TriageReport timer picks it up again — sending now could send it twice
+                _log.LogError(ex, "Run {RunId}: usage report failed — the next report run retries it", run.RunId);
+                return;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _log.LogError(ex, "Could not store run {RunId} for the delayed usage report — sending the emails now", run.RunId);
+                run.UsageError = $"usage storage not available: {ex.Message}";
+            }
+        }
+
+        await _report.SendEmailsAsync(run, ct);
+    }
+
+    internal static ProjectRunUsage DescribeProject(string slug, MonitoredProject project,
+        List<TriageOutcome> outcomes) => new()
+    {
+        Slug = slug,
+        GitHubOwner = project.GitHubOwner,
+        GitHubRepo = project.GitHubRepo,
+        Scanned = outcomes.Count,
+        Actionable = outcomes.Count(IsNewActionable),
+        AlreadyKnown = outcomes.Count(o => o.DuplicateOf is not null && o.MergedInto is null),
+        Merged = outcomes.Count(o => o.MergedInto is not null),
+        Dismissed = outcomes.Count(o => !o.Verdict.RequiresAction),
+        Issues = outcomes
+            .Where(o => IsNewActionable(o) && o.GitHubIssueNumber.HasValue)
+            .Select(o => new FiledIssueUsage
+            {
+                Number = o.GitHubIssueNumber!.Value,
+                Url = o.GitHubIssueUrl ?? "",
+                Title = !string.IsNullOrWhiteSpace(o.Verdict.IssueTitle) ? o.Verdict.IssueTitle : o.Candidate.ErrorTitle,
+                ErrorIds = o.AllErrorIds.ToList(),
+                Priority = o.Verdict.Priority,
+                ErrorType = o.Verdict.ErrorType,
+            })
+            .ToList(),
+    };
+
+    private static List<PendingEmail> BuildEmails(
+        List<TriageOutcome> outcomes, int lookbackHours, Func<TriageOutcome, string>? fileIssueLink)
+    {
+        var emails = new List<PendingEmail>();
         var byProject = outcomes
             .GroupBy(o => o.Candidate.ProjectSlug)
             .ToList();
@@ -315,18 +390,10 @@ public sealed class TriagePipeline
             var environment = items.FirstOrDefault()?.Candidate.Environment ?? "—";
             var body = TriageReportRenderer.RenderSummary(slug, items,
                 environment, EnvironmentConfig.MinOccurrences, lookbackHours, fileIssueLink);
-
-            try
-            {
-                await _mailer.DeliverAsync(subject, body, ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Failed to send email for project {Slug}", slug);
-            }
+            emails.Add(new PendingEmail { ProjectSlug = slug, Subject = subject, HtmlBody = body });
         }
 
-        // Send all-clear for monitored projects that had zero candidates
+        // All-clear for monitored projects that had zero candidates
         var projectsWithOutcomes = byProject.Select(g => g.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var monitoredProjects = JsonSerializer.Deserialize<List<MonitoredProject>>(
             EnvironmentConfig.ProjectsJson,
@@ -335,19 +402,15 @@ public sealed class TriagePipeline
         foreach (var mp in monitoredProjects)
         {
             if (projectsWithOutcomes.Contains(mp.Slug)) continue;
-
-            try
+            emails.Add(new PendingEmail
             {
-                await _mailer.DeliverAsync(
-                    $"GlitchPilot: All clear [{mp.Slug}]",
-                    TriageReportRenderer.RenderQuietNight(mp.Slug, 0, lookbackHours),
-                    ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "Failed to send email for project {Slug}", mp.Slug);
-            }
+                ProjectSlug = mp.Slug,
+                Subject = $"GlitchPilot: All clear [{mp.Slug}]",
+                HtmlBody = TriageReportRenderer.RenderQuietNight(mp.Slug, 0, lookbackHours),
+            });
         }
+
+        return emails;
     }
 
     private static string Plural(int count, string word) =>

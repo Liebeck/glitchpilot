@@ -152,3 +152,61 @@ internal sealed class FakeMailer : ISmtpMailer
         return Task.CompletedTask;
     }
 }
+
+internal sealed class FakeRunStore : IRunStore
+{
+    public bool IsEnabled { get; set; } = true;
+    public Dictionary<string, RunRecord> Pending { get; } = [];
+    public List<RunRecord> Completed { get; } = [];
+    public bool FailComplete { get; set; }
+
+    public Task SavePendingAsync(RunRecord run, CancellationToken ct = default)
+    {
+        Pending[run.RunId] = run;
+        return Task.CompletedTask;
+    }
+
+    public Task<List<RunRecord>> ListPendingAsync(CancellationToken ct = default) =>
+        Task.FromResult(Pending.Values.ToList());
+
+    public Task CompleteAsync(RunRecord run, CancellationToken ct = default)
+    {
+        if (FailComplete) throw new InvalidOperationException("blob storage down");
+        Pending.Remove(run.RunId);
+        Completed.Add(run);
+        return Task.CompletedTask;
+    }
+}
+
+internal sealed class FakeCopilot : ICopilotUsageClient
+{
+    /// <summary>Copilot activity per issue number; unknown issues have no session yet.</summary>
+    public Dictionary<int, CopilotIssueUsage> Issues { get; } = [];
+    public CopilotBillingDay? Billing { get; set; }
+    public List<DateOnly> BillingDays { get; } = [];
+    /// <summary>Simulates an unexpected exception (the real client catches API errors itself).</summary>
+    public bool Throw { get; set; }
+
+    public Task<CopilotIssueUsage> GetIssueUsageAsync(string owner, string repo, int issueNumber, CancellationToken ct = default)
+    {
+        if (Throw) throw new InvalidOperationException("GitHub exploded");
+        return Task.FromResult(Issues.TryGetValue(issueNumber, out var u) ? u : new CopilotIssueUsage { Status = "pending" });
+    }
+
+    public Task<CopilotBillingDay> GetBillingDayAsync(DateOnly day, CancellationToken ct = default)
+    {
+        BillingDays.Add(day);
+        if (Throw) throw new InvalidOperationException("GitHub exploded");
+        return Task.FromResult(Billing is null ? new CopilotBillingDay { Day = day } : new CopilotBillingDay
+        {
+            Day = day, Source = Billing.Source, Items = Billing.Items, Error = Billing.Error,
+        });
+    }
+
+    public static CopilotIssueUsage Completed(int pr, params double[] minutes) => new()
+    {
+        Status = "completed",
+        PullRequests = [new CopilotPullRequest { Number = pr, Url = $"https://github.com/org/repo/pull/{pr}", State = "open" }],
+        Sessions = minutes.Select((m, i) => new CopilotSession { WorkflowRunId = i + 1, Status = "completed", DurationMinutes = m }).ToList(),
+    };
+}

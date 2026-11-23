@@ -11,7 +11,7 @@ GlitchPilot connects your [GlitchTip](https://glitchtip.com) error tracker to AI
 3. **Merges duplicates** — errors GlitchTip split into several groups are merged into one issue; optionally, errors that match an already open issue / PR are not filed again
 4. **Files GitHub issues** with structured problem descriptions, acceptance criteria, and fix recommendations
 5. **Assigns Copilot** coding agent to immediately start working on fixes
-6. **Sends email** — per-project summary of all classified errors with links to GitHub issues
+6. **Sends email** — per-project summary of all classified errors with links to GitHub issues — once Copilot has finished, including token and AI-credit usage (see [Usage Tracking](#usage-tracking))
 
 ### How to run it
 
@@ -48,6 +48,10 @@ For each monitored project, GlitchPilot collects recent errors from GlitchTip, f
 # Main mode — scan, classify, file issues, send email
 dotnet run --project src/GlitchPilot.Console -- --mode triage
 
+# Send the delayed triage emails of pending runs (with Copilot usage); --force = don't wait for Copilot
+dotnet run --project src/GlitchPilot.Console -- --mode report
+dotnet run --project src/GlitchPilot.Console -- --mode report --force
+
 # Debug — inspect a single GlitchTip issue
 dotnet run --project src/GlitchPilot.Console -- --mode probe --issue 4
 dotnet run --project src/GlitchPilot.Console -- --mode probe --issue 4 --file        # also file GitHub issue
@@ -68,6 +72,7 @@ dotnet run --project src/GlitchPilot.Console -- --mode verify
 - All other config comes from Azure Function App Settings (same env vars as `.env`)
 - Runs on Consumption plan (executes in under a few minutes)
 - `FileIssue` (HTTP, `GET/POST /api/file-issue`) serves the "Create GitHub issue anyway" button from the email (see [Filing Dismissed Errors Manually](#filing-dismissed-errors-manually))
+- `TriageReport` runs every 15 minutes and sends the triage emails of pending runs once the Copilot sessions finished (see [Usage Tracking](#usage-tracking)). It uses the function's own storage account (`AzureWebJobsStorage`) unless `USAGE_STORAGE_CONNECTION` is set.
 
 ---
 
@@ -92,6 +97,29 @@ Transient errors with few occurrences are dismissed and get no issue. If you kno
 3. **Create GitHub issue** loads the error from GlitchTip again, re-classifies it for fresh issue text and files it like any other issue (labels, `glitchtip:{id}`, Copilot assignment) in the repository configured in `PROJECTS`. If an open issue / PR already carries its label, or GitHub cannot be queried, nothing is filed.
 
 The link is signed with HMAC-SHA256 (`LINK_SIGNING_KEY`) and expires after `LINK_EXPIRY_DAYS`. The signature is the only authorization: anyone holding an unexpired link from the email can file that one error, so treat the email accordingly. The button only appears when `FILE_ISSUE_URL` is set — in the Console as well, but the link always points at the deployed function. Generate a key e.g. with `openssl rand -base64 48`; rotating it invalidates all links sent so far.
+
+---
+
+## Usage Tracking
+
+GlitchPilot records what the Copilot cloud agent costs for the issues it files (GitHub AI credits) and stores it as JSON for later evaluation. The Azure OpenAI calls of the triage itself are not tracked.
+
+| Source | What | How exact |
+|--------|------|-----------|
+| **Copilot sessions** | Per filed issue: Copilot's PR, the agent's workflow runs (sessions), status and minutes | Exact (GitHub API) |
+| **GitHub billing** | AI credits / USD per model and SKU for the UTC day of the run — at the start of the run, at report time, and the difference (*during this run*) — plus the previous day (final) | Exact, but **per day only** |
+| **Cost per issue** | The cloud-agent cost *during this run* split across the run's issues by session minutes | Estimate (upper bound if other agent sessions ran at the same time) |
+
+GitHub does not report Copilot cost per session or per issue — only per day, model and SKU (`/users/{user}/settings/billing/ai_credit/usage`, falling back to `premium_request/usage` for legacy plans). So the triage run reads the day's totals **before** it files any issue, and the report reads them again once the Copilot sessions finished: the difference is what was used during the run, so usage from earlier that day no longer counts. With a single filed issue and no other agent sessions at the same time, that is the issue's cost. If the start snapshot is not usable (run crossed midnight UTC, or a billing call failed), the estimate falls back to the whole day (`costBasis`: `run` or `day`). Billing data can lag: usage that is booked late can still shift between the two snapshots, so each report also includes the previous day's final numbers.
+
+**Delayed email.** With usage storage configured, the triage run stores its emails as a *pending run* instead of sending them. `TriageReport` (Azure Function, every 15 min) or `--mode report` (CLI) checks the Copilot sessions and sends the emails — with a "Usage & cost" section — as soon as every filed issue has a finished Copilot session, at the latest after `REPORT_MAX_DELAY_MINUTES` (default 120). Runs without new issues are sent right away. Without storage, the email is sent immediately and has no usage section.
+
+**JSON.** Blob container `USAGE_CONTAINER` (default `glitchpilot-usage`):
+
+- `pending/{runId}.json` — waiting for Copilot (includes the rendered emails)
+- `runs/yyyy/MM/dd/{runId}.json` — final record: `projects[].issues[].copilot` (`pullRequests`, `sessions`, `totalSessionMinutes`, `estimatedGrossUsd`, `estimatedAiCredits`), `billingAtStart`, `billing`, `billingDuringRun`, `costBasis`, `billingPreviousDay`
+
+The billing endpoints cover **personal** Copilot plans. The classic `GITHUB_TOKEN` may need the `user` scope for them; if the call fails, the email shows the API error and everything else is still reported. Every step of the cost tracking fails soft: whatever cannot be determined (sessions, billing, the estimate, the usage storage) shows as `n/a` with the reason, and the triage email is still sent.
 
 ---
 
@@ -127,6 +155,7 @@ The link is signed with HMAC-SHA256 (`LINK_SIGNING_KEY`) and expires after `LINK
 | `GITHUB_AGENT_LABEL` | no | | Label for Copilot-assigned issues |
 | `GITHUB_ASSIGN_TO` | no | | Username to assign issues to |
 | `GITHUB_COPILOT_MODEL` | no | | Copilot model (leave empty for auto) |
+| `GITHUB_BILLING_USER` | no | owner of `GITHUB_TOKEN` | GitHub user whose personal Copilot plan is billed |
 | `SMTP_HOST` | yes | | SMTP server hostname |
 | `SMTP_PORT` | no | `587` | SMTP port |
 | `SMTP_USER` | yes | | SMTP username |
@@ -144,6 +173,9 @@ The link is signed with HMAC-SHA256 (`LINK_SIGNING_KEY`) and expires after `LINK
 | `FILE_ISSUE_URL` | no | | Full URL of the `FileIssue` function, e.g. `https://<app>.azurewebsites.net/api/file-issue`. Enables the button for dismissed transient errors |
 | `LINK_SIGNING_KEY` | if `FILE_ISSUE_URL` | | Secret (≥ 32 chars) that signs the button links; same value for triage and function |
 | `LINK_EXPIRY_DAYS` | no | `14` | Days a button link stays valid |
+| `USAGE_STORAGE_CONNECTION` | no | `AzureWebJobsStorage` | Blob Storage connection string for run records / usage JSON |
+| `USAGE_CONTAINER` | no | `glitchpilot-usage` | Blob container name |
+| `REPORT_MAX_DELAY_MINUTES` | no | `120` | Send the triage email at the latest this long after filing, even if Copilot is not done |
 | `TRIAGE_SCHEDULE` | no | `0 0 5 * * *` | Cron schedule (Azure Function only) |
 
 ### PROJECTS format
@@ -189,6 +221,9 @@ services.AddSingleton<IChatCompleter, AzureChatCompleter>();
 services.AddSingleton<IDuplicateDetector, DuplicateDetector>();
 services.AddSingleton<ISmtpMailer, SmtpMailer>();
 services.AddTransient<ManualFilingService>();
+services.AddSingleton<IRunStore, BlobRunStore>();
+services.AddSingleton<ICopilotUsageClient, CopilotUsageClient>();
+services.AddTransient<ReportPipeline>();
 services.AddTransient<TriagePipeline>();
 services.AddTransient<VerifyPipeline>();
 services.AddTransient<ProbePipeline>();
@@ -205,6 +240,7 @@ Both `Program.cs` files (Console and Functions) call the same `AddGlitchPilot()`
 | `Azure.AI.OpenAI` | Azure OpenAI chat completions |
 | `MailKit` | SMTP email delivery (STARTTLS) |
 | `Octokit` | GitHub issue creation and label queries |
+| `Azure.Storage.Blobs` | Pending runs and usage JSON |
 | `Microsoft.Azure.Functions.Worker` | Azure Functions isolated worker (Functions project only) |
 | `Microsoft.Azure.Functions.Worker.Extensions.Http` | HTTP trigger for the "Create GitHub issue" button (Functions project only) |
 

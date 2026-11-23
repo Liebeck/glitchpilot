@@ -29,7 +29,8 @@ return mode switch
     "triage" => await RunAsync<TriagePipeline>(host, cts.Token),
     "verify" => await RunAsync<VerifyPipeline>(host, cts.Token),
     "probe"  => await RunProbeAsync(host, args, cts.Token),
-    _ => Error($"Unknown mode '{mode}'. Use --mode triage, verify, or probe."),
+    "report" => await RunReportAsync(host, args, cts.Token),
+    _ => Error($"Unknown mode '{mode}'. Use --mode triage, report, verify, or probe."),
 };
 
 static async Task<int> RunAsync<T>(IHost host, CancellationToken ct) where T : class
@@ -49,6 +50,15 @@ static async Task<int> RunProbeAsync(IHost host, string[] args, CancellationToke
     var sendEmail = args.Contains("--email");
     var pipeline = host.Services.GetRequiredService<ProbePipeline>();
     await pipeline.RunAsync(issueId, fileIssue, sendEmail, ct);
+    return 0;
+}
+
+static async Task<int> RunReportAsync(IHost host, string[] args, CancellationToken ct)
+{
+    var pipeline = host.Services.GetRequiredService<ReportPipeline>();
+    if (!pipeline.StorageEnabled)
+        return Error("Report mode needs USAGE_STORAGE_CONNECTION (Azure Blob Storage connection string).");
+    await pipeline.RunAsync(force: args.Contains("--force"), ct);
     return 0;
 }
 

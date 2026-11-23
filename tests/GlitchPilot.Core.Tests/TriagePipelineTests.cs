@@ -53,7 +53,8 @@ public class TriagePipelineTests : IDisposable
             new FakeClassifier(),
             filer,
             new DuplicateDetector(chat, NullLogger<DuplicateDetector>.Instance),
-            mailer,
+            new FakeRunStore { IsEnabled = false },
+            new ReportPipeline(new FakeRunStore { IsEnabled = false }, new FakeCopilot(), mailer, NullLogger<ReportPipeline>.Instance),
             NullLogger<TriagePipeline>.Instance);
         return (pipeline, filer, mailer, chat);
     }

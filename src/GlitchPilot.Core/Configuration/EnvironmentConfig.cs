@@ -22,6 +22,8 @@ public static class EnvironmentConfig
     public static string? GitHubAgentLabel  => Read("GITHUB_AGENT_LABEL");
     public static string? GitHubAssignTo    => Read("GITHUB_ASSIGN_TO");
     public static string? CopilotModel      => Read("GITHUB_COPILOT_MODEL");
+    /// <summary>GitHub user whose (personal) Copilot plan pays for the agent; default: owner of GITHUB_TOKEN.</summary>
+    public static string? GitHubBillingUser => Read("GITHUB_BILLING_USER");
 
     // ── SMTP / Mail ────────────────────────────────────────
     public static string SmtpHost           => Require("SMTP_HOST");
@@ -71,6 +73,13 @@ public static class EnvironmentConfig
             return new ManualFilingSettings(url.Trim(), key.Trim(), ReadPositiveInt("LINK_EXPIRY_DAYS", 14));
         }
     }
+    // ── Usage tracking / delayed report ────────────────────
+    /// <summary>Blob Storage connection for run records (falls back to the Functions storage account).</summary>
+    public static string? UsageStorageConnection =>
+        Read("USAGE_STORAGE_CONNECTION") ?? Read("AzureWebJobsStorage");
+    public static string UsageContainer     => Read("USAGE_CONTAINER") ?? "glitchpilot-usage";
+    /// <summary>The triage email is sent once all Copilot sessions finished, at the latest after this many minutes.</summary>
+    public static int ReportMaxDelayMinutes => ReadNonNegativeInt("REPORT_MAX_DELAY_MINUTES", 120);
 
     // ── General ────────────────────────────────────────────
     public static int LookbackHours         => int.Parse(Read("LOOKBACK_HOURS") ?? "24");
@@ -92,6 +101,16 @@ public static class EnvironmentConfig
             ? value
             : throw new InvalidOperationException(
                 $"Environment variable '{name}' has invalid value '{raw}'. Use a positive number.");
+    }
+
+    private static int ReadNonNegativeInt(string name, int fallback)
+    {
+        var raw = Read(name);
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        return int.TryParse(raw.Trim(), out var value) && value >= 0
+            ? value
+            : throw new InvalidOperationException(
+                $"Environment variable '{name}' has invalid value '{raw}'. Use a number >= 0.");
     }
 
     private static bool ReadBool(string name, bool fallback)
