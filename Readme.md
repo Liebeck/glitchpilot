@@ -119,7 +119,7 @@ GitHub does not report Copilot cost per session or per issue — only per day, m
 - `pending/{runId}.json` — waiting for Copilot (includes the rendered emails)
 - `runs/yyyy/MM/dd/{runId}.json` — final record: `projects[].issues[].copilot` (`pullRequests`, `sessions`, `totalSessionMinutes`, `estimatedGrossUsd`, `estimatedAiCredits`), `billingAtStart`, `billing`, `billingDuringRun`, `costBasis`, `billingPreviousDay`
 
-The billing endpoints cover **personal** Copilot plans. The classic `GITHUB_TOKEN` may need the `user` scope for them; if the call fails, the email shows the API error and everything else is still reported. Every step of the cost tracking fails soft: whatever cannot be determined (sessions, billing, the estimate, the usage storage) shows as `n/a` with the reason, and the triage email is still sent.
+The billing endpoints cover **personal** Copilot plans. `GITHUB_TOKEN` needs billing access: fine-grained account permission **Plan: Read**, or the `user` scope on a classic PAT. Without it GitHub answers `404`, which the email shows as `n/a` with that hint. The cloud agent's credits appear under the SKU `Copilot Cloud Agent`. `tools/Test-CopilotBilling.ps1` checks a token outside the Function App. Every step of the cost tracking fails soft: whatever cannot be determined (sessions, billing, the estimate, the usage storage) shows as `n/a` with the reason, and the triage email is still sent.
 
 ---
 
@@ -150,7 +150,7 @@ The billing endpoints cover **personal** Copilot plans. The classic `GITHUB_TOKE
 | `OPENAI_ENDPOINT` | yes | | Azure OpenAI endpoint (base URL only) |
 | `OPENAI_KEY` | yes | | Azure OpenAI API key |
 | `OPENAI_MODEL` | no | `gpt-4o` | Deployment name |
-| `GITHUB_TOKEN` | yes | | Classic PAT with `repo` scope |
+| `GITHUB_TOKEN` | yes | | Fine-grained PAT (repository: Issues, Pull requests, Actions, Contents read/write, Metadata read; account: Plan read) or classic PAT with `repo` + `user` scopes |
 | `GITHUB_LABELS` | no | `glitchpilot` | Comma-separated base labels |
 | `GITHUB_AGENT_LABEL` | no | | Label for Copilot-assigned issues |
 | `GITHUB_ASSIGN_TO` | no | | Username to assign issues to |

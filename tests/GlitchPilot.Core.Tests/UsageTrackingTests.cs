@@ -11,7 +11,8 @@ namespace GlitchPilot.Core.Tests;
 public class UsageTrackingTests : IDisposable
 {
     private static readonly string[] s_vars =
-        ["PROJECTS", "MERGE_DUPLICATES_ENABLED", "DUPLICATE_SCAN_ENABLED", "REPORT_MAX_DELAY_MINUTES"];
+        ["PROJECTS", "MERGE_DUPLICATES_ENABLED", "DUPLICATE_SCAN_ENABLED", "REPORT_MAX_DELAY_MINUTES",
+         "GITHUB_TOKEN", "GITHUB_BILLING_USER"];
 
     private readonly Dictionary<string, string?> _saved = s_vars.ToDictionary(v => v, Environment.GetEnvironmentVariable);
 
@@ -420,6 +421,88 @@ public class UsageTrackingTests : IDisposable
         Assert.Equal(2.5m, item.GrossAmount);
         Assert.Equal(0m, item.NetAmount);
         Assert.Equal("claude-sonnet", item.Model);
+    }
+
+    // ── Billing API responses (shapes as returned by GitHub on 2026-11-26) ──
+
+    private static CopilotUsageClient BillingClient(Dictionary<string, (int Status, string Body)> responses)
+    {
+        Environment.SetEnvironmentVariable("GITHUB_TOKEN", "test-token");
+        Environment.SetEnvironmentVariable("GITHUB_BILLING_USER", "me");
+        return new CopilotUsageClient(NullLogger<CopilotUsageClient>.Instance, new StubHandler(responses));
+    }
+
+    private const string NotFoundBody = """{"message":"Not Found","status":"404"}""";
+
+    [Fact]
+    public async Task Billing_AllSources404_IsReportedAsMissingAccess()
+    {
+        var client = BillingClient(new()
+        {
+            ["ai_credit"] = (404, NotFoundBody),
+            ["premium_request"] = (404, NotFoundBody),
+        });
+
+        var day = await client.GetBillingDayAsync(new DateOnly(2026, 11, 26));
+
+        Assert.NotNull(day.Error);
+        Assert.Contains("Plan: Read", day.Error);
+        Assert.Empty(day.Items);
+        Assert.Contains("Plan: Read", UsageReportRenderer.Render(new RunRecord { Billing = day }, null));
+    }
+
+    [Fact]
+    public async Task Billing_EmptyAiCredits_IsNoUsage_NotAnError()
+    {
+        var client = BillingClient(new()
+        {
+            ["ai_credit"] = (200, """{"timePeriod":{"year":2026},"user":"me","usageItems":[]}"""),
+            ["premium_request"] = (404, NotFoundBody),
+        });
+
+        var day = await client.GetBillingDayAsync(new DateOnly(2026, 11, 26));
+
+        Assert.Null(day.Error);
+        Assert.Equal("ai_credit", day.Source);
+        Assert.Empty(day.Items);
+    }
+
+    [Fact]
+    public async Task Billing_ReadsCloudAgentSku()
+    {
+        var client = BillingClient(new()
+        {
+            ["ai_credit"] = (200, """
+                {"timePeriod":{"year":2026,"month":11,"day":26},"user":"me","usageItems":[
+                  {"product":"Copilot","sku":"Copilot AI Credits","model":"MAI Code 2 Flash","unitType":"ai-credits",
+                   "pricePerUnit":0.01,"grossQuantity":33.85,"grossAmount":0.3385,"discountQuantity":33.85,"discountAmount":0.3385,"netQuantity":0,"netAmount":0},
+                  {"product":"Copilot","sku":"Copilot Cloud Agent","model":"Auto: GPT-6 Luna","unitType":"ai-credits",
+                   "pricePerUnit":0.01,"grossQuantity":0.61,"grossAmount":0.0061,"discountQuantity":0.61,"discountAmount":0.0061,"netQuantity":0,"netAmount":0}
+                ]}
+                """),
+        });
+
+        var day = await client.GetBillingDayAsync(new DateOnly(2026, 11, 26));
+
+        Assert.Null(day.Error);
+        Assert.Equal(2, day.Items.Count);
+        Assert.Equal(0.0061m, day.AgentGrossUsd);
+        Assert.Equal(0.61m, day.AgentGrossQuantity);
+        Assert.Equal(0.3446m, day.CopilotGrossUsd);
+    }
+
+    private sealed class StubHandler(Dictionary<string, (int Status, string Body)> responses) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            var (status, body) = responses.FirstOrDefault(r => path.Contains($"/billing/{r.Key}/")).Value;
+            return Task.FromResult(new HttpResponseMessage((System.Net.HttpStatusCode)(status == 0 ? 404 : status))
+            {
+                RequestMessage = request,
+                Content = new StringContent(body ?? NotFoundBody),
+            });
+        }
     }
 
     [Fact]

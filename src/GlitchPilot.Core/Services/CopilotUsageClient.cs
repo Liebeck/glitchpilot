@@ -29,10 +29,12 @@ public sealed class CopilotUsageClient : ICopilotUsageClient
     private readonly ILogger<CopilotUsageClient> _log;
     private string? _billingUser = EnvironmentConfig.GitHubBillingUser;
 
-    public CopilotUsageClient(ILogger<CopilotUsageClient> log)
+    public CopilotUsageClient(ILogger<CopilotUsageClient> log) : this(log, new HttpClientHandler()) { }
+
+    internal CopilotUsageClient(ILogger<CopilotUsageClient> log, HttpMessageHandler handler)
     {
         _log = log;
-        _http = new HttpClient { BaseAddress = new Uri("https://api.github.com/") };
+        _http = new HttpClient(handler) { BaseAddress = new Uri("https://api.github.com/") };
         _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", EnvironmentConfig.GitHubToken);
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         _http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("GlitchPilot", "1.0"));
@@ -156,11 +158,13 @@ public sealed class CopilotUsageClient : ICopilotUsageClient
             var query = $"year={day.Year}&month={day.Month}&day={day.Day}";
 
             // AI credits (usage-based billing since June 2026); legacy plans still report premium requests
-            foreach (var source in new[] { "ai_credit", "premium_request" })
+            var sources = new[] { "ai_credit", "premium_request" };
+            var notFound = 0;
+            foreach (var source in sources)
             {
                 var url = $"users/{Uri.EscapeDataString(user)}/settings/billing/{source}/usage?{query}";
                 using var response = await SendAsync(url, BillingApiVersion, ct);
-                if (response.StatusCode == HttpStatusCode.NotFound) continue;
+                if (response.StatusCode == HttpStatusCode.NotFound) { notFound++; continue; }
                 await EnsureSuccessAsync(response, ct);
 
                 using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
@@ -171,6 +175,10 @@ public sealed class CopilotUsageClient : ICopilotUsageClient
                 result.Items = items;
                 return result;
             }
+
+            // GitHub answers 404 (not 403) when the token may not read billing — don't report that as "no usage"
+            if (notFound == sources.Length)
+                result.Error = MissingBillingAccess(user);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -179,6 +187,10 @@ public sealed class CopilotUsageClient : ICopilotUsageClient
         }
         return result;
     }
+
+    internal static string MissingBillingAccess(string user) =>
+        $"GitHub billing API returned 404 for user {user} — GITHUB_TOKEN probably lacks billing access " +
+        "(fine-grained: account permission \"Plan: Read\"; classic: scope \"user\"), or GITHUB_BILLING_USER is wrong";
 
     internal static List<BillingUsageItem> ParseBillingItems(JsonElement root)
     {
